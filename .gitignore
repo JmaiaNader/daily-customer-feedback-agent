@@ -1,0 +1,15 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+logs/*
+!logs/.gitkeep
+reports/*
+!reports/.gitkeep
+data/drive_download.xlsx
+
+# Secrets and local scheduler state
+.streamlit/secrets.toml
+scheduler_config.json
+recipient_lists.json
+logs/scheduler_status.json

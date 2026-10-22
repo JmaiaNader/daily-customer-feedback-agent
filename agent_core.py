@@ -1,0 +1,334 @@
+from pathlib import Path
+from datetime import datetime
+from urllib.parse import urlparse, parse_qs
+import re
+import json, os, smtplib, ssl
+from email.message import EmailMessage
+import pandas as pd
+import requests
+from config import (
+    OLLAMA_URL, OLLAMA_MODEL, GMAIL_ADDRESS, GMAIL_APP_PASSWORD,
+    REPORT_EMAIL_TO, REPORTS_DIR, LOGS_DIR, DRIVE_DOWNLOAD_URL, DRIVE_CACHE_FILE, GOOGLE_SERVICE_ACCOUNT_JSON
+)
+
+REQUIRED = {"SurveyDate", "StaffID", "StaffName", "Category", "CustomerComment", "CSATScore", "SurveyID"}
+
+def required_columns():
+    return REQUIRED
+
+def load_excel(source, sheet_name="rowdata"):
+    """Load the expected worksheet from a path or a file-like object (e.g. Streamlit upload)."""
+    if isinstance(source, (str, Path)):
+        path = Path(source)
+        if not path.exists():
+            raise FileNotFoundError(f"Excel file not found: {path}")
+        excel_source = path
+    else:
+        # Streamlit UploadedFile and BytesIO are supported by pandas.read_excel.
+        excel_source = source
+    df = pd.read_excel(excel_source, sheet_name=sheet_name)
+    missing = REQUIRED - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing columns in {sheet_name}: {', '.join(sorted(missing))}")
+    df["SurveyDate"] = pd.to_datetime(df["SurveyDate"], errors="coerce").dt.date
+    df["CSATScore"] = pd.to_numeric(df["CSATScore"], errors="coerce")
+    df = df.dropna(subset=["SurveyDate", "CSATScore"])
+    df["StaffID"] = df["StaffID"].astype(str)
+    df["StaffName"] = df["StaffName"].fillna("Unknown").astype(str)
+    df["Category"] = df["Category"].fillna("Uncategorized").astype(str)
+    df["CustomerComment"] = df["CustomerComment"].fillna("").astype(str)
+    return df
+
+
+def google_download_url(url):
+    """Convert Google Sheets/Drive share URLs into direct Excel download URLs."""
+    url = (url or "").strip()
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+
+    # Google Sheets: export the complete workbook as XLSX so pandas can select
+    # the configured worksheet (normally `rowdata`) from the downloaded file.
+    if host in {"docs.google.com", "sheets.google.com"}:
+        match = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", parsed.path)
+        if match:
+            return f"https://docs.google.com/spreadsheets/d/{match.group(1)}/export?format=xlsx"
+
+    # Google Drive file share links.
+    match = re.search(r"/file/d/([A-Za-z0-9_-]+)", parsed.path)
+    file_id = match.group(1) if match else None
+    if not file_id and host.endswith("drive.google.com"):
+        qs = parse_qs(parsed.query)
+        file_id = (qs.get("id") or [None])[0]
+    if file_id:
+        return f"https://drive.google.com/uc?export=download&id={file_id}"
+    return url
+
+
+def download_google_drive_excel(url=None, target_path=None, timeout=45):
+    """Download an Excel file or Google Sheets workbook. Link-based access only;
+    private company files require Google Drive OAuth/API authentication.
+    """
+    url = (url if url is not None else DRIVE_DOWNLOAD_URL).strip()
+    if not url:
+        raise RuntimeError("Google Drive is the scheduled source, but DRIVE_DOWNLOAD_URL is not configured in .env.")
+    # Private Google Drive/Sheets access can use a service-account JSON stored in
+    # an environment variable or Streamlit secret. Share the source file with that
+    # service account's email address. Public link downloads remain supported.
+    if GOOGLE_SERVICE_ACCOUNT_JSON:
+        try:
+            from google.oauth2.service_account import Credentials
+            from googleapiclient.discovery import build
+            from googleapiclient.http import MediaIoBaseDownload
+            import io
+            credentials_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+            credentials = Credentials.from_service_account_info(
+                credentials_info, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+            )
+            parsed = urlparse(url)
+            match = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", parsed.path)
+            if not match:
+                match = re.search(r"/file/d/([A-Za-z0-9_-]+)", parsed.path)
+            file_id = match.group(1) if match else (parse_qs(parsed.query).get("id") or [None])[0]
+            if not file_id:
+                raise ValueError("Could not identify the Google Drive file ID from DRIVE_DOWNLOAD_URL.")
+            service = build("drive", "v3", credentials=credentials, cache_discovery=False)
+            metadata = service.files().get(fileId=file_id, fields="id,name,mimeType").execute()
+            if metadata.get("mimeType") == "application/vnd.google-apps.spreadsheet":
+                request = service.files().export_media(
+                    fileId=file_id,
+                    mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            else:
+                request = service.files().get_media(fileId=file_id)
+            buffer = io.BytesIO()
+            downloader = MediaIoBaseDownload(buffer, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            content = buffer.getvalue()
+        except Exception as exc:
+            raise RuntimeError(f"Authenticated Google Drive download failed: {exc}") from exc
+    else:
+        download_url = google_download_url(url)
+        response = requests.get(download_url, timeout=timeout, allow_redirects=True)
+        response.raise_for_status()
+        content = response.content
+    # XLSX is a ZIP container and begins with PK; this catches HTML login/permission pages.
+    if not content.startswith(b"PK"):
+        raise RuntimeError(
+            "Google did not return an Excel workbook. Confirm that the spreadsheet is accessible "
+            "to the account running this app (for link-based access, enable suitable sharing). "
+            "Private company files require Google Drive OAuth/API authentication."
+        )
+    target = Path(target_path or DRIVE_CACHE_FILE)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    return target
+
+
+def get_available_dates(df):
+    return sorted(df["SurveyDate"].dropna().unique().tolist())
+
+def _ollama_analysis(comments, model):
+    prompt = f"""
+You are a careful customer-experience analyst. Analyze only the supplied survey comments.
+Return valid JSON only with keys: sentiment_summary, recurring_issues, positive_themes,
+root_cause_hypotheses, recommended_actions.
+For every hypothesis, clearly label it as a hypothesis, not a proven fact.
+Do not invent facts, counts, scores, or staff performance explanations.
+Keep the answer concise and actionable. Do not infer that a named staff member caused a complaint.
+Comments (each prefixed with an ID):
+{json.dumps(comments, ensure_ascii=False)}
+"""
+    response = requests.post(
+        f"{OLLAMA_URL.rstrip('/')}/api/generate",
+        json={"model": model or OLLAMA_MODEL, "prompt": prompt, "stream": False,
+              "format": "json", "options": {"temperature": 0.1}},
+        timeout=240
+    )
+    response.raise_for_status()
+    body = response.json().get("response", "")
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        return {"sentiment_summary": body, "recurring_issues": [], "positive_themes": [],
+                "root_cause_hypotheses": [], "recommended_actions": [],
+                "warning": "Model response was not valid JSON; inspect raw summary."}
+
+def _fallback_analysis(day_df):
+    low = day_df[day_df["CSATScore"] <= 2]
+    high = day_df[day_df["CSATScore"] >= 4]
+    return {
+        "sentiment_summary": f"{len(high)} surveys have CSAT 4–5; {len(low)} surveys have CSAT 1–2.",
+        "recurring_issues": low.groupby("Category").size().sort_values(ascending=False).head(5).reset_index().rename(columns={0:"count"}).to_dict("records"),
+        "positive_themes": ["Review high-scoring comments to identify service practices worth repeating."],
+        "root_cause_hypotheses": ["Treat any possible cause as a hypothesis until operational data confirms it."],
+        "recommended_actions": ["Review low-CSAT comments by category and investigate the highest-volume issue."]
+    }
+
+def analyze_day(df, selected_date, model=None, use_llm=True):
+    """Analyze one date or an inclusive (start_date, end_date) date range."""
+    if isinstance(selected_date, (tuple, list)):
+        if len(selected_date) != 2:
+            raise ValueError("Date range must contain a start date and an end date.")
+        start_date, end_date = selected_date
+        if start_date > end_date:
+            raise ValueError("Start date must be on or before end date.")
+        day_df = df[(df["SurveyDate"] >= start_date) & (df["SurveyDate"] <= end_date)].copy()
+        report_date = str(start_date) if start_date == end_date else f"{start_date}_to_{end_date}"
+        report_title_date = str(start_date) if start_date == end_date else f"{start_date} to {end_date}"
+    else:
+        day_df = df[df["SurveyDate"] == selected_date].copy()
+        report_date = str(selected_date)
+        report_title_date = str(selected_date)
+    if day_df.empty:
+        raise ValueError(f"No survey rows found for {report_title_date}")
+    day_df["CSATScore"] = pd.to_numeric(day_df["CSATScore"], errors="coerce")
+    day_df = day_df.dropna(subset=["CSATScore"])
+    if ((day_df["CSATScore"] < 1) | (day_df["CSATScore"] > 5)).any():
+        raise ValueError("CSATScore must be between 1 and 5.")
+    count = int(len(day_df))
+    avg = float(day_df["CSATScore"].mean())
+    positive = float((day_df["CSATScore"] >= 4).mean() * 100)
+    low_rate = float((day_df["CSATScore"] <= 2).mean() * 100)
+
+    staff = (day_df.groupby(["StaffID", "StaffName"], dropna=False)
+             .agg(survey_count=("SurveyID", "count"), average_csat=("CSATScore", "mean"),
+                  min_csat=("CSATScore", "min"), max_csat=("CSATScore", "max"))
+             .reset_index())
+    # Ranking is shown with sample counts and a configurable minimum sample threshold in report.
+    staff = staff.sort_values(["average_csat", "survey_count"], ascending=[True, False])
+    category = (day_df.groupby("Category")
+                .agg(survey_count=("SurveyID", "count"), average_csat=("CSATScore", "mean"))
+                .reset_index().sort_values(["average_csat", "survey_count"], ascending=[True, False]))
+    low_comments = day_df[day_df["CSATScore"] <= 2][["SurveyID", "Category", "CustomerComment"]]
+    comments = [{"survey_id": r.SurveyID, "category": r.Category, "comment": r.CustomerComment}
+                for r in day_df[["SurveyID", "Category", "CustomerComment"]].itertuples(index=False)]
+    ai = _ollama_analysis(comments, model) if use_llm else _fallback_analysis(day_df)
+    if not use_llm:
+        ai["analysis_mode"] = "Python-only fallback; Ollama was not used."
+
+    staff_records = []
+    for r in staff.to_dict("records"):
+        staff_records.append({
+            "staff_id": str(r["StaffID"]), "staff_name": str(r["StaffName"]),
+            "survey_count": int(r["survey_count"]), "average_csat": round(float(r["average_csat"]), 2),
+            "min_csat": float(r["min_csat"]), "max_csat": float(r["max_csat"])
+        })
+    category_records = [{"category": str(r["Category"]), "survey_count": int(r["survey_count"]),
+                         "average_csat": round(float(r["average_csat"]), 2)}
+                        for r in category.to_dict("records")]
+    min_avg = min(staff_records, key=lambda x: x["average_csat"])
+    max_avg = max(staff_records, key=lambda x: x["average_csat"])
+    payload = {
+        "report_date": report_date,
+        "report_period": report_title_date,
+        "metrics": {"survey_count": count, "average_csat": round(avg, 2),
+                    "positive_rate_pct": round(positive, 1), "low_rate_pct": round(low_rate, 1)},
+        "staff_rankings": staff_records,
+        "lowest_staff_average_csat": min_avg,
+        "highest_staff_average_csat": max_avg,
+        "category_summary": category_records,
+        "ai_analysis": ai,
+        "data_quality_notes": [
+            "Staff comparisons are based only on surveys in the selected report period.",
+            "Show survey counts beside averages; one or two surveys are not enough for a robust performance conclusion.",
+            "Survey feedback alone does not establish individual staff causality."
+        ]
+    }
+    md = render_markdown(payload)
+    payload["report_markdown"] = md
+    return {"payload": payload, "report_markdown": md,
+            "json_text": json.dumps(payload, ensure_ascii=False, indent=2),
+            "metrics": payload["metrics"]}
+
+def _bullets(value):
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            if isinstance(item, dict):
+                out.append("- " + "; ".join(f"{k}: {v}" for k,v in item.items()))
+            else:
+                out.append(f"- {item}")
+        return "\n".join(out) if out else "- No items returned."
+    if isinstance(value, dict):
+        return "\n".join(f"- **{k}:** {v}" for k,v in value.items())
+    return f"- {value}" if value else "- No items returned."
+
+def render_markdown(p):
+    m = p["metrics"]
+    low, high = p["lowest_staff_average_csat"], p["highest_staff_average_csat"]
+    lines = [
+        f"# Customer Feedback Report — {p.get('report_period', p['report_date'])}", "",
+        "## KPI Summary", "",
+        f"- Survey count: **{m['survey_count']}**",
+        f"- Average CSAT: **{m['average_csat']}/5**",
+        f"- Positive CSAT (4–5): **{m['positive_rate_pct']}%**",
+        f"- Low CSAT (1–2): **{m['low_rate_pct']}%**", "",
+        "## Staff CSAT Comparison", "",
+        f"- Lowest average: **{low['staff_name']} ({low['staff_id']})** — {low['average_csat']}/5 across {low['survey_count']} survey(s).",
+        f"- Highest average: **{high['staff_name']} ({high['staff_id']})** — {high['average_csat']}/5 across {high['survey_count']} survey(s).",
+        "",
+        "| Staff ID | Staff name | Surveys | Avg CSAT | Min | Max |",
+        "|---|---|---:|---:|---:|---:|"
+    ]
+    for s in p["staff_rankings"]:
+        lines.append(f"| {s['staff_id']} | {s['staff_name']} | {s['survey_count']} | {s['average_csat']} | {s['min_csat']} | {s['max_csat']} |")
+    lines += ["", "## Category Summary", "", "| Category | Surveys | Avg CSAT |", "|---|---:|---:|"]
+    for c in p["category_summary"]:
+        lines.append(f"| {c['category']} | {c['survey_count']} | {c['average_csat']} |")
+    ai = p["ai_analysis"]
+    lines += ["", "## Feedback Analysis", "", "### Sentiment summary", "", str(ai.get("sentiment_summary", "Not available.")),
+              "", "### Recurring issues", "", _bullets(ai.get("recurring_issues")),
+              "", "### Positive themes", "", _bullets(ai.get("positive_themes")),
+              "", "### Root-cause hypotheses (not confirmed facts)", "", _bullets(ai.get("root_cause_hypotheses")),
+              "", "### Recommended actions", "", _bullets(ai.get("recommended_actions")),
+              "", "## Interpretation note", "",
+              "Staff rankings are descriptive and based on the available survey sample only. They should not be used as a standalone employee-performance judgment.",
+              ""]
+    return "\n".join(lines)
+
+def save_report(result, reports_dir=REPORTS_DIR):
+    reports_dir = Path(reports_dir)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    d = result["payload"]["report_date"]
+    md_path = reports_dir / f"customer_feedback_{d}.md"
+    json_path = reports_dir / f"customer_feedback_{d}.json"
+    md_path.write_text(result["report_markdown"], encoding="utf-8")
+    json_path.write_text(result["json_text"], encoding="utf-8")
+    return md_path
+
+def send_gmail(recipient, subject, body):
+    sender = GMAIL_ADDRESS
+    password = GMAIL_APP_PASSWORD.replace(" ", "")
+    if not sender or not password:
+        raise RuntimeError("Set GMAIL_ADDRESS and GMAIL_APP_PASSWORD in .env or Streamlit secrets first.")
+    if not recipient or "@" not in recipient:
+        raise ValueError("Enter a valid recipient email address.")
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg.set_content(body)
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context, timeout=30) as server:
+        server.login(sender, password)
+        server.send_message(msg)
+
+def get_last_processed_date(state_path=None):
+    state_path = Path(state_path or (LOGS_DIR / "state.json"))
+    if not state_path.exists():
+        return None
+    try:
+        return json.loads(state_path.read_text(encoding="utf-8")).get("last_successful_date")
+    except Exception:
+        return None
+
+def set_last_processed_date(day, state_path=None):
+    state_path = Path(state_path or (LOGS_DIR / "state.json"))
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({"last_successful_date": str(day),
+                                      "updated_at": datetime.now().isoformat(timespec="seconds")},
+                                     indent=2), encoding="utf-8")
