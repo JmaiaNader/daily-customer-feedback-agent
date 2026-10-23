@@ -5,6 +5,8 @@ import re
 import json, os, smtplib, ssl
 from email.message import EmailMessage
 import pandas as pd
+from insights_engine import build_csat_insights
+from email_report import render_html_report
 import requests
 from config import (
     OLLAMA_URL, OLLAMA_MODEL, GMAIL_ADDRESS, GMAIL_APP_PASSWORD,
@@ -181,6 +183,10 @@ def get_available_dates(df):
     return sorted(df["SurveyDate"].dropna().unique().tolist())
 
 def _ollama_analysis(comments, model):
+    # Respect the local-model-only setup: never send comments to a hosted Ollama API.
+    ollama_host = urlparse((OLLAMA_URL or "http://localhost:11434").strip()).hostname
+    if ollama_host not in {"localhost", "127.0.0.1", "::1"}:
+        raise RuntimeError("Local Ollama only is enabled. Set OLLAMA_URL to http://localhost:11434; remote Ollama endpoints are not used.")
     prompt = f"""
 You are a careful customer-experience analyst. Analyze only the supplied survey comments.
 Return valid JSON only with keys: sentiment_summary, recurring_issues, positive_themes,
@@ -255,9 +261,21 @@ def analyze_day(df, selected_date, model=None, use_llm=True):
     low_comments = day_df[day_df["CSATScore"] <= 2][["SurveyID", "Category", "CustomerComment"]]
     comments = [{"survey_id": r.SurveyID, "category": r.Category, "comment": r.CustomerComment}
                 for r in day_df[["SurveyID", "Category", "CustomerComment"]].itertuples(index=False)]
-    ai = _ollama_analysis(comments, model) if use_llm else _fallback_analysis(day_df)
-    if not use_llm:
+    if use_llm:
+        try:
+            ai = _ollama_analysis(comments, model)
+            ai["analysis_mode"] = "Local Ollama analysis"
+        except Exception as exc:
+            # Keep the operational report usable even when the local model is stopped
+            # or unreachable (common when the admin app is hosted in the cloud).
+            ai = _fallback_analysis(day_df)
+            ai["analysis_mode"] = "Python fallback; local Ollama was unavailable."
+            ai["warning"] = f"Local Ollama could not be reached: {type(exc).__name__}: {str(exc)[:240]}"
+    else:
+        ai = _fallback_analysis(day_df)
         ai["analysis_mode"] = "Python-only fallback; Ollama was not used."
+
+    cx_insights = build_csat_insights(day_df)
 
     staff_records = []
     for r in staff.to_dict("records"):
@@ -280,6 +298,7 @@ def analyze_day(df, selected_date, model=None, use_llm=True):
         "lowest_staff_average_csat": min_avg,
         "highest_staff_average_csat": max_avg,
         "category_summary": category_records,
+        "cx_insights": cx_insights,
         "ai_analysis": ai,
         "data_quality_notes": [
             "Staff comparisons are based only on surveys in the selected report period.",
@@ -334,7 +353,43 @@ def render_markdown(p):
               "", "### Positive themes", "", _bullets(ai.get("positive_themes")),
               "", "### Root-cause hypotheses (not confirmed facts)", "", _bullets(ai.get("root_cause_hypotheses")),
               "", "### Recommended actions", "", _bullets(ai.get("recommended_actions")),
-              "", "## Interpretation note", "",
+              ""]
+    insights = p.get("cx_insights") or {}
+    insight_metrics = insights.get("metrics", {})
+    if insight_metrics:
+        lines += ["## Executive Summary & Customer Impact", "",
+                  str(insights.get("executive_summary", "No summary available.")), "",
+                  f"- Critical score-1 cases: **{insight_metrics.get('critical_score1_count', 0)}**",
+                  f"- Distinct named customers represented in low-score cases: **{insight_metrics.get('customers_with_low_scores', 0)}**",
+                  ""]
+    lines += ["## Alerts & Recommended Actions", ""]
+    alerts = insights.get("alerts", [])
+    if alerts:
+        for alert in alerts:
+            lines += [f"### [{alert.get('severity', 'INFO')}] {alert.get('title', 'Alert')}",
+                      f"- **Signal:** {alert.get('metric', '')}",
+                      f"- **What it means:** {alert.get('detail', '')}",
+                      f"- **Recommended action:** {alert.get('recommendation', '')}", ""]
+    else:
+        lines += ["No rule-based CSAT alerts were triggered for this period.", ""]
+    categories_insight = insights.get("category_summary", [])
+    if categories_insight:
+        lines += ["## Category Impact Table", "",
+                  "| Category | Surveys | Average CSAT | Low CSAT (1-2) | Low CSAT % | Named customers impacted |",
+                  "|---|---:|---:|---:|---:|---:|"]
+        for row in categories_insight[:15]:
+            lines.append(f"| {row.get('Category', '')} | {row.get('Surveys', 0)} | {row.get('Average CSAT', 0)} | {row.get('Low CSAT (1-2)', 0)} | {row.get('Low CSAT %', 0)}% | {row.get('Named customers impacted', 0)} |")
+        lines.append("")
+    themes = insights.get("keyword_themes", [])
+    if themes:
+        lines += ["## Feedback Text Signals", "",
+                  "These are keyword-based signals from low-score comments, not confirmed root causes.", "",
+                  "| Theme signal | Keyword matches |", "|---|---:|"]
+        for row in themes[:10]:
+            lines.append(f"| {row.get('Theme signal', '')} | {row.get('Keyword matches', 0)} |")
+        lines.append("")
+    lines += ["## Interpretation note", "",
+              "Customer impact counts use distinct non-empty CustomerName values, not a verified customer identifier. Category/theme patterns are signals to investigate, not proof of root cause.",
               "Staff rankings are descriptive and based on the available survey sample only. They should not be used as a standalone employee-performance judgment.",
               ""]
     return "\n".join(lines)
@@ -347,9 +402,11 @@ def save_report(result, reports_dir=REPORTS_DIR):
     json_path = reports_dir / f"customer_feedback_{d}.json"
     md_path.write_text(result["report_markdown"], encoding="utf-8")
     json_path.write_text(result["json_text"], encoding="utf-8")
+    html_path = reports_dir / f"customer_feedback_{d}.html"
+    html_path.write_text(render_html_report(result["payload"]), encoding="utf-8")
     return md_path
 
-def send_gmail(recipient, subject, body):
+def send_gmail(recipient, subject, body, html_body=None):
     sender = GMAIL_ADDRESS
     password = GMAIL_APP_PASSWORD.replace(" ", "")
     if not sender or not password:
@@ -360,7 +417,10 @@ def send_gmail(recipient, subject, body):
     msg["Subject"] = subject
     msg["From"] = sender
     msg["To"] = recipient
+    # Keep a plain-text alternative for clients that cannot render HTML.
     msg.set_content(body)
+    if html_body:
+        msg.add_alternative(html_body, subtype="html")
     context = ssl.create_default_context()
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context, timeout=30) as server:
         server.login(sender, password)

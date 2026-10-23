@@ -15,9 +15,11 @@ except ImportError:  # Keep unit tests/imports usable before dependencies are in
 
 from agent_core import (analyze_day, load_google_sheet, get_available_dates,
                         save_report, send_gmail)
+from email_report import render_html_report
 from config import (DRIVE_DOWNLOAD_URL, ENABLE_BACKGROUND_SCHEDULER, LOGS_DIR,
                     OLLAMA_MODEL, RECIPIENT_LISTS_FILE, SCHEDULER_CONFIG_FILE,
-                    SCHEDULER_STATUS_FILE, SCHEDULER_TIMEZONE, SHEET_NAME)
+                    SCHEDULER_STATUS_FILE, SCHEDULER_TIMEZONE, SHEET_NAME,
+                    RECIPIENTS_SPREADSHEET_URL)
 
 _LOG = logging.getLogger(__name__)
 _RUN_LOCK = threading.Lock()
@@ -69,7 +71,18 @@ def save_schedule_config(config):
 
 
 def load_recipient_lists():
-    """Read named lists from Streamlit secrets, then local JSON, then legacy default email."""
+    """Read managed lists from the private Google Sheet first, then legacy config."""
+    if RECIPIENTS_SPREADSHEET_URL:
+        try:
+            from feedback_service import load_recipient_lists_from_sheet
+            managed = load_recipient_lists_from_sheet()
+            # Once a private store is configured, never fall back to sample/stale
+            # emails if its tab has not yet been created. The UI can initialize it.
+            return managed if managed is not None else {}
+        except Exception:
+            _LOG.exception("Could not load managed recipient lists from the private spreadsheet")
+            # Do not silently use stale recipient addresses when the configured source fails.
+            raise
     try:
         import streamlit as st
         raw = st.secrets.get("recipient_lists", None)
@@ -95,10 +108,51 @@ def load_recipient_lists():
         return {}
 
 
+def save_recipient_lists(lists):
+    """Persist the entire named-list mapping to the configured store."""
+    normalised = {str(name).strip(): _normalise_emails(emails)
+                  for name, emails in (lists or {}).items() if str(name).strip()}
+    if RECIPIENTS_SPREADSHEET_URL:
+        from feedback_service import save_recipient_lists_to_sheet
+        return save_recipient_lists_to_sheet(normalised)
+    _write_json(RECIPIENT_LISTS_FILE, normalised)
+    return normalised
+
+
+def _validate_recipient_list(name, emails):
+    list_name = str(name or "").strip()
+    if not list_name:
+        raise ValueError("Enter a name for the recipient list.")
+    if len(list_name) > 80:
+        raise ValueError("Recipient-list name must be 80 characters or fewer.")
+    if isinstance(emails, str):
+        raw = emails.replace(";", ",").replace("\n", ",").split(",")
+    else:
+        raw = list(emails or [])
+    normalized = _normalise_emails(raw)
+    if not normalized:
+        raise ValueError("Add at least one valid email address to the list.")
+    invalid = [str(item).strip() for item in raw
+               if str(item).strip() and ("@" not in str(item).strip() or any(c.isspace() for c in str(item).strip()))]
+    if invalid:
+        raise ValueError("Invalid email address(es): " + ", ".join(invalid))
+    return list_name, normalized
+
+
 def _normalise_emails(values):
     if isinstance(values, str):
-        values = values.replace(";", ",").split(",")
-    return list(dict.fromkeys(str(v).strip() for v in (values or []) if "@" in str(v)))
+        values = values.replace(";", ",").replace("\n", ",").split(",")
+    result = []
+    seen = set()
+    for value in values or []:
+        address = str(value).strip()
+        if not address or "@" not in address or any(char.isspace() for char in address):
+            continue
+        key = address.casefold()
+        if key not in seen:
+            result.append(address)
+            seen.add(key)
+    return result
 
 
 def _status_update(**updates):
@@ -171,7 +225,7 @@ def run_scheduled_job(config_override=None):
             raise RuntimeError(f"Recipient list '{list_name}' is missing or empty. No email was sent.")
         send_gmail(", ".join(recipients),
                    f"Customer Feedback Report — {result['payload'].get('report_period', result['payload']['report_date'])}",
-                   result["report_markdown"])
+                   result["report_markdown"], html_body=render_html_report(result["payload"]))
         finished = datetime.now(ZoneInfo(SCHEDULER_TIMEZONE)).isoformat(timespec="seconds")
         _status_update(status="Success", started_at=started, finished_at=finished,
                        last_report_period=result["payload"].get("report_period", result["payload"]["report_date"]),

@@ -23,7 +23,7 @@ from config import (
     GOOGLE_SERVICE_ACCOUNT_FILE,
     BASE_DIR,
     SCHEDULER_TIMEZONE,
-    SHEET_NAME,
+    SHEET_NAME, RECIPIENTS_SPREADSHEET_URL, RECIPIENTS_SHEET_NAME,
 )
 
 STAFF_LIST = [
@@ -199,6 +199,111 @@ def _read_sheet_values(service, spreadsheet_id, sheet_name=None):
     ).execute()
     return result.get("values", [])
 
+
+
+def _spreadsheet_tab_titles(service, spreadsheet_id):
+    metadata = service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id, fields="sheets.properties.title"
+    ).execute()
+    return [
+        str(item.get("properties", {}).get("title", ""))
+        for item in metadata.get("sheets", [])
+    ]
+
+
+def load_recipient_lists_from_sheet(*, service=None, spreadsheet_url=None, sheet_name=None):
+    """Load persistent recipient lists from a separate private Google spreadsheet.
+
+    Returns None if no separate recipient spreadsheet is configured or its recipient
+    tab has not yet been created. An existing tab with only a header returns {} so an
+    intentionally emptied store is not replaced by stale legacy settings.
+    """
+    url = (spreadsheet_url if spreadsheet_url is not None else RECIPIENTS_SPREADSHEET_URL).strip()
+    if not url:
+        return None
+    api = service or _sheets_service()
+    spreadsheet_id = spreadsheet_id_from_url(url)
+    tab = sheet_name or RECIPIENTS_SHEET_NAME or "recipient_lists"
+    if tab not in _spreadsheet_tab_titles(api, spreadsheet_id):
+        return None
+    safe_tab = tab.replace("'", "''")
+    result = api.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id, range=f"'{safe_tab}'!A:B",
+        valueRenderOption="FORMATTED_VALUE",
+    ).execute()
+    values = result.get("values", [])
+    if not values:
+        return {}
+    headers = [str(v).strip().casefold() for v in values[0]]
+    if headers[:2] != ["listname", "email"]:
+        raise RuntimeError(
+            f"The '{tab}' tab must have these columns in row 1: ListName, Email. "
+            "Do not use the public feedback spreadsheet for recipients."
+        )
+    lists = {}
+    for row in values[1:]:
+        name = str(row[0]).strip() if row else ""
+        email = str(row[1]).strip() if len(row) > 1 else ""
+        if not name:
+            continue
+        lists.setdefault(name, [])
+        if email and "@" in email and not any(c.isspace() for c in email):
+            if email.casefold() not in {existing.casefold() for existing in lists[name]}:
+                lists[name].append(email)
+    return lists
+
+
+def save_recipient_lists_to_sheet(lists, *, service=None, spreadsheet_url=None, sheet_name=None):
+    """Replace all saved recipient lists in a dedicated private Google spreadsheet."""
+    url = (spreadsheet_url if spreadsheet_url is not None else RECIPIENTS_SPREADSHEET_URL).strip()
+    if not url:
+        raise RuntimeError(
+            "Recipient-list storage is not configured. Create a separate PRIVATE Google spreadsheet, "
+            "share it with the service account as Editor, and set RECIPIENTS_SPREADSHEET_URL."
+        )
+    api = service or _sheets_service()
+    spreadsheet_id = spreadsheet_id_from_url(url)
+    tab = sheet_name or RECIPIENTS_SHEET_NAME or "recipient_lists"
+    if tab not in _spreadsheet_tab_titles(api, spreadsheet_id):
+        try:
+            api.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": [{"addSheet": {"properties": {"title": tab}}}],},
+            ).execute()
+        except Exception:
+            # A concurrent first save may already have created the tab.
+            if tab not in _spreadsheet_tab_titles(api, spreadsheet_id):
+                raise
+    safe_tab = tab.replace("'", "''")
+    api.spreadsheets().values().clear(
+        spreadsheetId=spreadsheet_id, range=f"'{safe_tab}'!A:Z", body={}
+    ).execute()
+    rows = [["ListName", "Email"]]
+    for name in sorted(lists, key=lambda item: str(item).casefold()):
+        list_name = str(name).strip()
+        if not list_name:
+            continue
+        raw_emails = lists[name]
+        if isinstance(raw_emails, str):
+            raw_emails = re.split(r"[,;\n]+", raw_emails)
+        emails = []
+        seen = set()
+        for item in raw_emails or []:
+            address = str(item).strip()
+            if address and "@" in address and not any(c.isspace() for c in address):
+                if address.casefold() not in seen:
+                    emails.append(address)
+                    seen.add(address.casefold())
+        if emails:
+            rows.extend([[list_name, address] for address in emails])
+        else:
+            # Preserve an intentionally created but empty list.
+            rows.append([list_name, ""])
+    api.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id, range=f"'{safe_tab}'!A1",
+        valueInputOption="RAW", body={"values": rows},
+    ).execute()
+    return {name: list(emails) for name, emails in lists.items()}
 
 def _column_letter(number):
     """Convert a one-based column number to an A1 column label."""

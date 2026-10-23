@@ -6,3 +6,4 @@ python-dotenv>=1.0
 APScheduler>=3.10,<4
 google-api-python-client>=2.150
 google-auth>=2.35
+plotly>=5.24

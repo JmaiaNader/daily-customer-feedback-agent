@@ -4,6 +4,7 @@ from datetime import date, timedelta
 from config import OLLAMA_MODEL, REPORT_EMAIL_TO, LOGS_DIR, SHEET_NAME
 from agent_core import (load_google_sheet, analyze_day, save_report, send_gmail,
                         get_last_processed_date, set_last_processed_date)
+from email_report import render_html_report
 from config import DRIVE_DOWNLOAD_URL
 
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -34,7 +35,7 @@ def main():
         result = analyze_day(df, yesterday, model=OLLAMA_MODEL, use_llm=True)
         save_report(result)
         # Mark processed only after successful email, so failed sends can be retried.
-        send_gmail(REPORT_EMAIL_TO, f"Daily Customer Feedback Report — {target}", result["report_markdown"])
+        send_gmail(REPORT_EMAIL_TO, f"Daily Customer Feedback Report — {target}", result["report_markdown"], html_body=render_html_report(result["payload"]))
         set_last_processed_date(yesterday)
         logging.info("Successfully processed and emailed yesterday (%s).", target)
     except Exception:
