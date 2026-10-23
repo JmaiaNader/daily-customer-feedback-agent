@@ -2,7 +2,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from agent_core import (
-    load_excel, analyze_day, get_available_dates, send_gmail,
+    load_excel, load_google_sheet, analyze_day, get_available_dates, send_gmail,
     save_report, get_last_processed_date, set_last_processed_date,
     required_columns
 )
@@ -10,25 +10,24 @@ from config import BASE_DIR, DATA_FILE, REPORTS_DIR, DRIVE_DOWNLOAD_URL, ENABLE_
 from scheduler_service import (load_schedule_config, save_schedule_config, load_scheduler_status,
                                load_recipient_lists, run_scheduled_job, start_background_scheduler)
 from datetime import time as dt_time
-from agent_core import download_google_drive_excel
 
 st.set_page_config(page_title="Daily Customer Feedback Agent", page_icon="📊", layout="wide")
 st.title("📊 Daily Customer Feedback Analysis Agent")
-st.caption("Excel → Python analytics → optional Ollama → Gmail, with configurable report scheduling")
+st.caption("Google Sheets → Python analytics → optional local Ollama → Gmail, with configurable report scheduling")
 BACKGROUND_SCHEDULER_RUNNING = start_background_scheduler()
 
 with st.sidebar:
     st.header("Settings")
     source = st.radio(
         "Data source",
-        ["Google Drive (default file)", "Laptop (test upload)"],
+        ["Google Sheets (live data)", "Laptop (test upload)"],
         index=0,
-        help="Google Drive is the default source. Laptop upload is intended for manual testing only."
+        help="Google Sheets is the live source. Laptop upload is intended for manual testing only."
     )
     drive_url = st.text_input(
-        "Google Drive Excel URL",
+        "Google Sheets URL",
         value=DRIVE_DOWNLOAD_URL,
-        help="Use a link that permits downloading. Private company files require Google Drive OAuth/API."
+        help="Use your native Google Sheets URL. The app reads it through the configured service account."
     )
     sheet = st.text_input("Worksheet", value="rowdata")
     model = st.text_input("Ollama model", value="gemma3:4b")
@@ -47,14 +46,13 @@ def read_source(uploaded_file=None):
             st.error(f"Could not read the uploaded Excel file: {e}")
             return None
     if not drive_url.strip():
-        st.error("Configure DRIVE_DOWNLOAD_URL in .env or enter a Google Drive URL in the sidebar.")
+        st.error("Configure DRIVE_DOWNLOAD_URL in .env or enter the Google Sheets URL in the sidebar.")
         return None
     try:
-        temp = download_google_drive_excel(drive_url)
-        return load_excel(temp, sheet_name=sheet)
+        return load_google_sheet(drive_url, sheet_name=sheet)
     except Exception as e:
-        st.error(f"Could not download/read Google Drive file: {e}")
-        st.info("This link-based method works only when the file can be downloaded via its link. Private Drive files need OAuth/API access.")
+        st.error(f"Could not read Google Sheet: {e}")
+        st.info("Check that DRIVE_DOWNLOAD_URL points to the converted native Google Sheet, the service-account JSON path is correct, and the sheet is shared with that service-account email as Editor.")
         return None
 
 tab1, tab2, tab3, tab4 = st.tabs(["Run analysis", "Data preview", "Scheduler", "How to use"])
@@ -64,10 +62,10 @@ with tab1:
     uploaded_file = None
     if source == "Laptop (test upload)":
         uploaded_file = st.file_uploader("Choose an Excel file from your laptop", type=["xlsx", "xls"], key="desktop_excel_upload")
-        st.caption("Desktop uploads are for manual testing and do not change the Scheduler's Google Drive source.")
+        st.caption("Desktop uploads are for manual testing and do not change the Scheduler's Google Sheets source.")
     else:
-        st.caption("The app will load the configured default Excel file from Google Drive.")
-    if st.button("Load Excel", type="secondary"):
+        st.caption("The app will load the configured native Google Sheet through the service account.")
+    if st.button("Load data", type="secondary"):
         df = read_source(uploaded_file)
         if df is not None:
             st.session_state["data"] = df
@@ -117,7 +115,7 @@ with tab1:
                         st.success(f"Saved: {path}")
                     st.divider()
                     st.subheader("Review before sending")
-                    st.caption("The report above is the exact content that will be sent. Review it before confirming. Desktop-loaded data is for testing; the Scheduler always reads Google Drive.")
+                    st.caption("The report above is the exact content that will be sent. Review it before confirming. Desktop-loaded data is for testing; the Scheduler always reads Google Sheets.")
                     recipient = st.text_input("Send report to", placeholder="you@gmail.com", key="recipient")
                     confirm_send = st.checkbox("I reviewed the report and want to send it by Gmail.")
                     if st.button("Send reviewed report with Gmail", disabled=not confirm_send):
@@ -128,7 +126,7 @@ with tab1:
                             st.error(f"Email failed: {e}")
                     st.warning("Staff ranking uses only the selected date range. Small sample sizes can make rankings unstable.")
     else:
-        st.info("Choose Google Drive for the default data source, or Laptop for a manual test upload, then click **Load Excel**.")
+        st.info("Choose Google Sheets for the default data source, or Laptop for a manual test upload, then click **Load data**.")
 
 with tab2:
     st.subheader("Excel data preview — rowdata")
@@ -187,7 +185,7 @@ with tab2:
 
 with tab4:
     st.subheader("Scheduled report configuration")
-    st.caption(f"Schedule timezone: {SCHEDULER_TIMEZONE}. The scheduler always reads Google Drive; laptop uploads are never used for scheduled reports.")
+    st.caption(f"Schedule timezone: {SCHEDULER_TIMEZONE}. The scheduler always reads Google Sheets; laptop uploads are never used for scheduled reports.")
     if BACKGROUND_SCHEDULER_RUNNING:
         st.success("Background scheduler is enabled in this running app process.")
     elif not ENABLE_BACKGROUND_SCHEDULER:
@@ -259,7 +257,7 @@ with tab4:
     if status.get("last_overlap_message"):
         st.warning(f"Overlap protection: {status['last_overlap_message']} (total skipped overlaps: {status.get('overlap_count', 1)}; last at {status.get('last_overlap_at', 'unknown time')}).")
     if st.button("Run scheduled report now", type="secondary", help="Runs the saved configuration once, including its email send."):
-        with st.spinner("Downloading Google Drive data, generating the report, and sending email..."):
+        with st.spinner("Reading Google Sheets data, generating the report, and sending email..."):
             ok = run_scheduled_job()
         latest = load_scheduler_status()
         if ok:
@@ -275,10 +273,10 @@ with tab3:
     st.markdown("""
 1. Install Python 3.11 or newer.
 2. Run `pip install -r requirements.txt`.
-3. Copy `.env.example` to `.env`; set `DRIVE_DOWNLOAD_URL` to your default Google Drive Excel link and configure Gmail if needed.
+3. Copy `.env.example` to `.env`; set `DRIVE_DOWNLOAD_URL` to your native Google Sheets URL and configure Gmail if needed.
 4. Install Ollama and pull a model, e.g. `ollama pull gemma3:4b`.
 5. Run `streamlit run app.py`.
-6. Choose Google Drive (default) or Laptop (manual test upload). The Scheduler always uses Google Drive only.
+6. Choose Google Sheets (live data) or Laptop (manual test upload). The Scheduler always uses the configured Google Sheet only.
 7. Open Scheduler to configure the date range, time, frequency, and saved recipient list.
 """)
     st.subheader("Important")
@@ -287,5 +285,5 @@ with tab3:
 - Staff CSAT comparisons are descriptive, not proof that a staff member caused a score.
 - Manual email requires confirmation. Scheduled email uses the separate Scheduler page and sends automatically when its enabled job runs.
 - On Streamlit Community Cloud, do not rely on an in-process background scheduler: the app may sleep/restart. Use an external scheduler/worker for reliable production delivery.
-- The Scheduler uses Google Drive only and never falls back to the local/sample Excel. Link-based download requires a link that permits downloading; private company Drive files need OAuth/API authentication.
+- The Scheduler reads the configured native Google Sheet through the service account and never falls back to the local/sample Excel file.
 """)

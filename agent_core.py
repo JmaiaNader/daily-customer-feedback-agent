@@ -16,8 +16,32 @@ REQUIRED = {"SurveyDate", "StaffID", "StaffName", "Category", "CustomerComment",
 def required_columns():
     return REQUIRED
 
+def _normalize_survey_dataframe(df, sheet_name="rowdata"):
+    """Apply the same schema and type validation to Excel and Google Sheets data."""
+    df = df.copy()
+    df.columns = [str(col).strip() for col in df.columns]
+    missing = REQUIRED - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing columns in {sheet_name}: {', '.join(sorted(missing))}")
+    # Google Sheets can return dates formatted according to spreadsheet locale;
+    # format='mixed' accepts both ISO dates and locale-rendered date strings.
+    df["SurveyDate"] = pd.to_datetime(df["SurveyDate"], errors="coerce", format="mixed").dt.date
+    df["CSATScore"] = pd.to_numeric(df["CSATScore"], errors="coerce")
+    df = df.dropna(subset=["SurveyDate", "CSATScore"])
+    df["StaffID"] = df["StaffID"].fillna("").astype(str)
+    df["StaffName"] = df["StaffName"].fillna("Unknown").astype(str)
+    df["Category"] = df["Category"].fillna("Uncategorized").astype(str)
+    # CustomerName was added for the feedback-form workflow. Keep older sources readable.
+    if "CustomerName" not in df.columns:
+        df["CustomerName"] = "Unknown Customer"
+    df["CustomerName"] = df["CustomerName"].fillna("Unknown Customer").astype(str).str.strip()
+    df.loc[df["CustomerName"].eq(""), "CustomerName"] = "Unknown Customer"
+    df["CustomerComment"] = df["CustomerComment"].fillna("").astype(str)
+    return df
+
+
 def load_excel(source, sheet_name="rowdata"):
-    """Load the expected worksheet from a path or a file-like object (e.g. Streamlit upload)."""
+    """Load the expected worksheet from a path or a file-like object."""
     if isinstance(source, (str, Path)):
         path = Path(source)
         if not path.exists():
@@ -27,17 +51,42 @@ def load_excel(source, sheet_name="rowdata"):
         # Streamlit UploadedFile and BytesIO are supported by pandas.read_excel.
         excel_source = source
     df = pd.read_excel(excel_source, sheet_name=sheet_name)
-    missing = REQUIRED - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing columns in {sheet_name}: {', '.join(sorted(missing))}")
-    df["SurveyDate"] = pd.to_datetime(df["SurveyDate"], errors="coerce").dt.date
-    df["CSATScore"] = pd.to_numeric(df["CSATScore"], errors="coerce")
-    df = df.dropna(subset=["SurveyDate", "CSATScore"])
-    df["StaffID"] = df["StaffID"].astype(str)
-    df["StaffName"] = df["StaffName"].fillna("Unknown").astype(str)
-    df["Category"] = df["Category"].fillna("Uncategorized").astype(str)
-    df["CustomerComment"] = df["CustomerComment"].fillna("").astype(str)
-    return df
+    return _normalize_survey_dataframe(df, sheet_name)
+
+
+def load_google_sheet(url=None, sheet_name="rowdata"):
+    """Read the live native Google Sheet through the service account / Sheets API.
+
+    This avoids unauthenticated `/export?format=xlsx` downloads, which fail for
+    private sheets and were the source of the dashboard 401 error.
+    """
+    from feedback_service import _sheets_service, spreadsheet_id_from_url
+
+    spreadsheet_url = (url if url is not None else DRIVE_DOWNLOAD_URL).strip()
+    spreadsheet_id = spreadsheet_id_from_url(spreadsheet_url)
+    service = _sheets_service()
+    safe_sheet_name = str(sheet_name).replace("'", "''")
+    range_name = f"'{safe_sheet_name}'!A:Z"
+    response = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=range_name,
+        valueRenderOption="FORMATTED_VALUE",
+        dateTimeRenderOption="FORMATTED_STRING",
+    ).execute()
+    values = response.get("values", [])
+    if not values or not any(str(v).strip() for v in values[0]):
+        raise ValueError(f"Google Sheet tab '{sheet_name}' is empty or its header row is missing.")
+    headers = [str(value).strip() for value in values[0]]
+    if len(headers) != len(set(headers)):
+        raise ValueError(f"Google Sheet tab '{sheet_name}' has duplicate column headers.")
+    data_rows = []
+    for row in values[1:]:
+        row = list(row)
+        if len(row) < len(headers):
+            row += [None] * (len(headers) - len(row))
+        data_rows.append(row[:len(headers)])
+    df = pd.DataFrame(data_rows, columns=headers)
+    return _normalize_survey_dataframe(df, sheet_name)
 
 
 def google_download_url(url):

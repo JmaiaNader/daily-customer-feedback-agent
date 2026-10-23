@@ -13,8 +13,8 @@ try:
 except ImportError:  # Keep unit tests/imports usable before dependencies are installed.
     BackgroundScheduler = CronTrigger = DateTrigger = None
 
-from agent_core import (analyze_day, download_google_drive_excel, get_available_dates,
-                        load_excel, save_report, send_gmail)
+from agent_core import (analyze_day, load_google_sheet, get_available_dates,
+                        save_report, send_gmail)
 from config import (DRIVE_DOWNLOAD_URL, ENABLE_BACKGROUND_SCHEDULER, LOGS_DIR,
                     OLLAMA_MODEL, RECIPIENT_LISTS_FILE, SCHEDULER_CONFIG_FILE,
                     SCHEDULER_STATUS_FILE, SCHEDULER_TIMEZONE, SHEET_NAME)
@@ -123,7 +123,7 @@ def load_scheduler_status():
 def _resolve_dates(config, df):
     available = get_available_dates(df)
     if not available:
-        raise ValueError("The Google Drive workbook contains no valid SurveyDate values.")
+        raise ValueError("The Google Sheet contains no valid SurveyDate values.")
     mode = config.get("date_mode", "yesterday")
     today = datetime.now(ZoneInfo(SCHEDULER_TIMEZONE)).date()
     if mode == "yesterday":
@@ -154,11 +154,10 @@ def run_scheduled_job(config_override=None):
     _status_update(status="Running", started_at=started, error="", last_report_period="")
     try:
         config = config_override or load_schedule_config()
-        # The scheduler intentionally always uses the configured remote Drive source.
+        # The scheduler always reads the same native Google Sheet as the dashboard.
         if not DRIVE_DOWNLOAD_URL:
-            raise RuntimeError("Google Drive source is not configured. Set DRIVE_DOWNLOAD_URL in secrets or .env.")
-        path = download_google_drive_excel(DRIVE_DOWNLOAD_URL)
-        df = load_excel(path, SHEET_NAME)
+            raise RuntimeError("Google Sheets source is not configured. Set DRIVE_DOWNLOAD_URL in secrets or .env.")
+        df = load_google_sheet(DRIVE_DOWNLOAD_URL, SHEET_NAME)
         start, end = _resolve_dates(config, df)
         subset = df[(df["SurveyDate"] >= start) & (df["SurveyDate"] <= end)]
         if subset.empty:

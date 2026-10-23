@@ -1,22 +1,24 @@
-"""Scheduled entry point. Always reads the configured Google Drive source, never a local desktop/sample file."""
+"""Scheduled entry point. Always reads the configured native Google Sheets source, never a local desktop/sample file."""
 import logging
 from datetime import date, timedelta
 from config import OLLAMA_MODEL, REPORT_EMAIL_TO, LOGS_DIR, SHEET_NAME
-from agent_core import (load_excel, analyze_day, save_report, send_gmail,
-                        get_last_processed_date, set_last_processed_date,
-                        download_google_drive_excel)
+from agent_core import (load_google_sheet, analyze_day, save_report, send_gmail,
+                        get_last_processed_date, set_last_processed_date)
+from config import DRIVE_DOWNLOAD_URL
 
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(filename=LOGS_DIR / "scheduler.log", level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 
-def resolve_data_file():
-    """Always download the latest configured Google Drive file; deliberately no local fallback."""
-    return download_google_drive_excel()
+def resolve_data():
+    """Read the latest configured native Google Sheet; deliberately no local fallback."""
+    if not DRIVE_DOWNLOAD_URL:
+        raise RuntimeError("Google Sheets source is not configured. Set DRIVE_DOWNLOAD_URL in .env.")
+    return load_google_sheet(DRIVE_DOWNLOAD_URL, SHEET_NAME)
 
 def main():
     """Process yesterday only. A successful date is not emailed twice."""
-    logging.info("Scheduled run started; source=Google Drive only.")
+    logging.info("Scheduled run started; source=Google Sheets only.")
     yesterday = date.today() - timedelta(days=1)
     target = str(yesterday)
     try:
@@ -24,8 +26,7 @@ def main():
         if last == target:
             logging.info("Yesterday (%s) was already processed successfully; skipping.", target)
             return
-        data_file = resolve_data_file()
-        df = load_excel(data_file, SHEET_NAME)
+        df = resolve_data()
         day_df = df[df["SurveyDate"] == yesterday]
         if day_df.empty:
             logging.info("No survey rows found for yesterday (%s); nothing to email.", target)

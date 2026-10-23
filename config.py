@@ -25,8 +25,11 @@ OLLAMA_MODEL = _secret_or_env("OLLAMA_MODEL", "gemma3:4b")
 GMAIL_ADDRESS = _secret_or_env("GMAIL_ADDRESS", "")
 GMAIL_APP_PASSWORD = _secret_or_env("GMAIL_APP_PASSWORD", "")
 REPORT_EMAIL_TO = _secret_or_env("REPORT_EMAIL_TO", "")
-DRIVE_DOWNLOAD_URL = _secret_or_env("DRIVE_DOWNLOAD_URL", "https://docs.google.com/spreadsheets/d/1V9pm0CqemhWb-wwzcMYrPln4WPdIpiX9/edit?gid=1633225144#gid=1633225144").strip()
+DRIVE_DOWNLOAD_URL = _secret_or_env(
+    "DRIVE_DOWNLOAD_URL", ""
+).strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = _secret_or_env("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+GOOGLE_SERVICE_ACCOUNT_FILE = _secret_or_env("GOOGLE_SERVICE_ACCOUNT_FILE", "")
 SCHEDULER_TIMEZONE = _secret_or_env("SCHEDULER_TIMEZONE", "Asia/Qatar")
 ENABLE_BACKGROUND_SCHEDULER = str(_secret_or_env("ENABLE_BACKGROUND_SCHEDULER", "true")).lower() in {"1", "true", "yes"}
 DRIVE_CACHE_FILE = BASE_DIR / "data" / "drive_download.xlsx"

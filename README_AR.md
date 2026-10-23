@@ -108,7 +108,9 @@ python run_daily.py
 
 ## 8) الأعمدة الموجودة في ملف Excel
 
-`SurveyID`, `SurveyDate`, `StaffID`, `StaffName`, `Category`, `CustomerComment`, `CSATScore`, `FlightNumber`, `Airport`, `Channel`, `Language`
+`SurveyID`, `SurveyDate`, `StaffID`, `StaffName`, `Category`, `CustomerName`, `CustomerComment`, `CSATScore`, `FlightNumber`, `Airport`, `Channel`, `Language`
+
+> ملاحظة: أسماء العملاء في ملف البيانات التجريبي مُولّدة لأغراض ورشة العمل فقط وليست بيانات عملاء حقيقية. يدعم التحميل ملفات Google Drive القديمة التي لا تحتوي على `CustomerName` مؤقتًا، إلى حين تحديث المخطط المباشر.
 
 CSATScore يجب أن يكون رقمًا من 1 إلى 5. التواريخ بصيغة `YYYY-MM-DD`. الملف المرفق يحتوي على بيانات اصطناعية للتجربة فقط.
 

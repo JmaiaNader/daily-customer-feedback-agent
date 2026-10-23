@@ -10,7 +10,7 @@
 
 ## Google Drive access
 
-- For a deliberately public/demo spreadsheet, set `DRIVE_DOWNLOAD_URL` in secrets; link-based download is used.
+- For a deliberately public/demo spreadsheet, set `DRIVE_DOWNLOAD_URL` in secrets; Google Sheets API access is used.
 - For private Drive/Sheets data, set `GOOGLE_SERVICE_ACCOUNT_JSON` to the service account JSON as a TOML multiline string and share the source file with the service account's `client_email` as Viewer. The app uses read-only Drive API access. Do not commit the JSON key. In a managed company environment, prefer a company-approved identity/secret manager.
 - A URL is configuration, not an authentication credential. A private URL by itself does not grant access.
 

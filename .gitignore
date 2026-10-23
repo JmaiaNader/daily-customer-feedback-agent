@@ -13,3 +13,8 @@ data/drive_download.xlsx
 scheduler_config.json
 recipient_lists.json
 logs/scheduler_status.json
+
+# Private service-account credentials
+secrets/
+service-account*.json
+credentials/*.json
