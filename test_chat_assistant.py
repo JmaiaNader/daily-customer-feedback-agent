@@ -69,3 +69,90 @@ def test_low_scores_by_staff_returns_staff_breakdown():
     answer = answer_question(sample_frame(), "Which staff has most low scores?")
     assert "Amira Ben Salem" in answer
     assert "low_scores" in answer
+
+
+def test_decline_question_uses_llm_instead_of_only_kpi_fallback(monkeypatch):
+    import chat_assistant
+
+    def fake_call(df, question, model=None, deterministic_evidence=None):
+        assert question == "Why did CSAT decline in this period?"
+        assert len(df) == 3
+        return ("**Gemma AI interpretation — local Ollama**\n\nRecurring likely issue: long waits and baggage handling; validate against operations.", None)
+
+    monkeypatch.setattr(chat_assistant, "_call_local_ollama", fake_call)
+    answer = answer_question(sample_frame(), "Why did CSAT decline in this period?", model="gemma3:4b", use_llm=True)
+    assert "Gemma AI interpretation" in answer
+    assert "long waits" in answer
+
+
+def test_failed_ai_interpretation_is_labelled_python_only(monkeypatch):
+    import chat_assistant
+
+    monkeypatch.setattr(chat_assistant, "_call_local_ollama", lambda *args, **kwargs: (None, "Ollama unavailable"))
+    answer = answer_question(sample_frame(), "Why did CSAT decline in this period?", model="gemma3:4b", use_llm=True)
+    assert "Gemma AI analysis not completed" in answer
+    assert "Python-only" in answer
+    assert "Ollama unavailable" in answer
+
+
+def test_force_llm_uses_ai_columns_table(monkeypatch):
+    import chat_assistant
+    df = sample_frame().copy()
+    df["AI_Category"] = ["Baggage", "Check-in & Boarding", "Customer Service & Staff Communication"]
+    df["primary_issue"] = ["Delayed bag", "Long queue", "Helpful agent"]
+    df["secondary_issue"] = ["None", "None", "None"]
+    df["sentiment"] = ["Negative", "Negative", "Positive"]
+    df["root_cause_hypothesis"] = ["Handling delay", "Staffing demand", "None"]
+    df["recommended_action"] = ["Review baggage timeline", "Review queue capacity", "Maintain good service"]
+    seen = {}
+
+    def fake_call(frame, question, model=None, deterministic_evidence=None):
+        seen["columns"] = set(frame.columns)
+        seen["question"] = question
+        return ("**Gemma AI interpretation — local Ollama**\n\nTest result.", None)
+
+    monkeypatch.setattr(chat_assistant, "_call_local_ollama", fake_call)
+    answer = answer_question(df, "Analyze this AI-enriched table", model="gemma3:4b", use_llm=True, force_llm=True)
+    assert "AI_Category" in seen["columns"]
+    assert "primary_issue" in seen["columns"]
+    assert "recommended_action" in seen["columns"]
+    assert "Gemma AI interpretation" in answer
+
+
+def test_local_ollama_prompt_includes_ai_enriched_fields(monkeypatch):
+    import chat_assistant
+
+    df = sample_frame().copy()
+    df["AI_Category"] = ["Baggage", "Check-in & Boarding", "Customer Service & Staff Communication"]
+    df["primary_issue"] = ["Delayed bag", "Long queue", "Helpful agent"]
+    df["secondary_issue"] = ["Not stated", "Not stated", "Not stated"]
+    df["sentiment"] = ["Negative", "Negative", "Positive"]
+    df["root_cause_hypothesis"] = ["Handling delay", "Queue capacity", "Not applicable"]
+    df["recommended_action"] = ["Review bag timeline", "Review queue capacity", "Maintain practice"]
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {"response": "Drivers: baggage delay and long check-in queues. Validate causes with timestamps."}
+
+    monkeypatch.setattr(chat_assistant, "OLLAMA_URL", "http://localhost:11434")
+    def fake_post(url, json, timeout):
+        captured["url"] = url
+        captured["body"] = json
+        captured["timeout"] = timeout
+        return FakeResponse()
+    monkeypatch.setattr(chat_assistant.requests, "post", fake_post)
+
+    answer, error = chat_assistant._call_local_ollama(df, "Why is CSAT low?", model="gemma3:4b")
+    assert error is None
+    assert "Gemma AI interpretation" in answer
+    prompt = captured["body"]["prompt"]
+    for field in ["AI_Category", "primary_issue", "sentiment", "root_cause_hypothesis", "recommended_action"]:
+        assert field in prompt
+    assert "Do not just repeat KPI totals" in prompt
+    assert captured["timeout"] == (10, 180)
+    assert captured["body"]["options"]["num_ctx"] == 4096
+    assert captured["body"]["options"]["num_predict"] == 600
+    assert captured["body"]["keep_alive"] == "10m"

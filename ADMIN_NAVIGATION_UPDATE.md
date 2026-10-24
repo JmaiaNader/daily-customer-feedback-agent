@@ -2,19 +2,19 @@
 
 The admin interface now uses separate pages in the left navigation menu:
 
-- **Dashboard** — load feedback and run CSAT analysis.
+- **Chat assistant** — load live feedback, choose start/end dates, ask questions using example prompts, review answers as HTML, and share a result by email after confirmation. Full reports can still be previewed in HTML and explicitly sent.
+- **AI Solution** — select survey dates and use local Gemma to add airline-specific issue categories, sentiment, root-cause hypotheses, and recommended actions to the displayed/exported rows.
+- **Dashboard** — run CSAT analysis.
 - **Data preview** — inspect or export loaded rows.
-- **Chat assistant** — ask questions against refreshed feedback data and prepare/review reports before explicitly sending them.
 - **Settings** — configure per-session app options and create, update, or delete saved report recipient lists.
 - **Scheduler** — set up scheduled reporting.
-- **How to use** — setup notes.
 
 ## Apply the update
 
 1. Replace the repository's `app.py` with the updated `app.py` from this package.
 2. Commit and push the change to the branch used by the private admin app on Streamlit Community Cloud.
 3. Let the admin app redeploy, or reboot it from the Cloud dashboard.
-4. Open the admin URL. Use the left-side **Open page** navigation to switch between **Chat assistant** and **Settings**.
+4. Open the admin URL. Use the left-side **Open page** navigation to open **Chat assistant** or **AI Solution** first; other pages remain available below them.
 
 The participant-facing `feedback_app.py` does not change and should remain deployed as its separate public app.
 

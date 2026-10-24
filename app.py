@@ -15,6 +15,7 @@ from scheduler_service import (load_schedule_config, save_schedule_config, load_
 from chat_assistant import answer_question, is_report_request
 from insights_engine import build_csat_insights, prepare_insight_frame
 from email_report import render_html_report
+from chat_result_html import render_chat_result_html, render_chat_result_plain_text
 from datetime import time as dt_time
 
 
@@ -43,7 +44,7 @@ with st.sidebar:
     st.header("Navigation")
     page = st.radio(
         "Open page",
-        ["Dashboard", "Data preview", "Chat assistant", "Settings", "Scheduler", "How to use"],
+        ["Chat assistant", "AI Solution", "Dashboard", "Data preview", "Settings", "Scheduler"],
         key="admin_page_navigation",
         label_visibility="collapsed",
     )
@@ -347,11 +348,11 @@ elif page == "Data preview":
 
 elif page == "Chat assistant":
     st.subheader("CSAT Data Assistant")
-    st.caption("Ask questions about real feedback. Python computes counts, customer impact, charts and alerts; local Ollama can interpret otherwise unsupported questions when it is reachable from this machine. Report emails always require review and explicit confirmation.")
+    st.caption("Load live feedback, choose a date range, ask a business question, review the HTML-formatted answer, and share that result by email when needed.")
 
     refresh_col, source_col = st.columns([1, 3])
     with refresh_col:
-        refresh_chat_data = st.button("Refresh live feedback data", type="primary", key="refresh_assistant_data")
+        refresh_chat_data = st.button("Load / refresh feedback rows", type="primary", key="refresh_assistant_data")
     with source_col:
         st.caption(f"Live data source: {drive_url or 'not configured'} · Worksheet: {sheet}")
     if refresh_chat_data:
@@ -361,13 +362,14 @@ elif page == "Chat assistant":
             st.session_state["assistant_messages"] = []
             st.session_state.pop("pending_report", None)
             st.session_state.pop("assistant_ai_interpretation", None)
+            st.session_state.pop("assistant_latest_result", None)
             st.success(f"Loaded {len(st.session_state['assistant_df'])} feedback rows from the live Google Sheet.")
         except Exception as exc:
             st.error(f"Could not load live feedback: {exc}")
 
     assistant_df = st.session_state.get("assistant_df")
     if assistant_df is None:
-        st.info("Click **Refresh live feedback data** to load the latest submissions before asking questions.")
+        st.info("Click **Load / refresh feedback rows** to load the latest submissions before asking questions.")
     else:
         if st.session_state.get("assistant_data_loaded_at"):
             st.caption(f"Data last refreshed: {st.session_state['assistant_data_loaded_at']} · {len(assistant_df)} rows")
@@ -376,8 +378,8 @@ elif page == "Chat assistant":
             st.warning("No valid survey dates are available in the live data.")
         else:
             date_left, date_right = st.columns(2)
-            chat_start = date_left.date_input("Query/report from", value=available_dates[0], min_value=available_dates[0], max_value=available_dates[-1], key="chat_range_start")
-            chat_end = date_right.date_input("Query/report to", value=available_dates[-1], min_value=available_dates[0], max_value=available_dates[-1], key="chat_range_end")
+            chat_start = date_left.date_input("Start date", value=available_dates[0], min_value=available_dates[0], max_value=available_dates[-1], key="chat_range_start")
+            chat_end = date_right.date_input("End date", value=available_dates[-1], min_value=available_dates[0], max_value=available_dates[-1], key="chat_range_end")
             if chat_start > chat_end:
                 st.error("The start date must be on or before the end date.")
             else:
@@ -390,7 +392,7 @@ elif page == "Chat assistant":
                     run_comment_ai = st.button("Generate local Ollama analysis", key="chat_generate_local_ai", disabled=not use_llm,
                                                help="Uses the configured local Ollama model only when it is reachable from the machine running this app.")
                 with ai_info:
-                    st.caption("The charts, alert counts and customer-impact metrics are calculated in Python. Optional Ollama commentary analyses feedback themes; on Streamlit Cloud, your laptop's localhost is not reachable.")
+                    st.caption(f"Model configured: {model} · Ollama interpretation: {'enabled' if use_llm else 'disabled in Settings'}. Questions asking why, explain, or recommend should invoke the local model; if Ollama fails, the answer will say clearly that it is Python-only.")
                 if run_comment_ai:
                     with st.spinner("Asking the configured Ollama model to interpret comments..."):
                         try:
@@ -405,8 +407,31 @@ elif page == "Chat assistant":
                 if saved_ai and saved_ai.get("range") == (str(chat_start), str(chat_end)):
                     render_ai_interpretation(saved_ai.get("analysis"), key_prefix="chat_ai")
 
-                with st.form("feedback_chat_form", clear_on_submit=True):
-                    user_question = st.text_input("Ask a question", placeholder="e.g. Which customers need recovery? What alerts need action? Why did CSAT decline? Prepare a report for Managers.")
+                st.markdown("#### Example questions")
+                st.caption("Choose an example to put it in the question box, or type your own question below.")
+                examples = [
+                    ("Executive summary", "Give me an executive summary and recommended actions."),
+                    ("Top low-CSAT category", "Which category has the most low-CSAT records?"),
+                    ("Low-score comments", "Show low score comments and identify recurring issues."),
+                    ("Why CSAT declined?", "Why did CSAT decline in this period?"),
+                ]
+                # Give each submitted question a fresh widget key. This prevents Streamlit's
+                # form-clear behavior from leaving the next submission bound to a stale blank
+                # value after the first question.
+                question_generation = int(st.session_state.get("chat_question_generation", 0))
+                question_key = f"chat_question_input_{question_generation}"
+                example_cols = st.columns(4)
+                for col, (label, example_question) in zip(example_cols, examples):
+                    with col:
+                        if st.button(label, key=f"chat_example_{label.lower().replace(' ', '_').replace('?', '')}", use_container_width=True):
+                            st.session_state[question_key] = example_question
+
+                with st.form("feedback_chat_form", clear_on_submit=False):
+                    user_question = st.text_input(
+                        "Chat assistant question",
+                        placeholder="Ask about CSAT, customer complaints, categories, trends, root-cause hypotheses, or actions…",
+                        key=question_key,
+                    )
                     ask_clicked = st.form_submit_button("Ask assistant", type="primary")
                 if ask_clicked:
                     if not user_question.strip():
@@ -416,6 +441,7 @@ elif page == "Chat assistant":
                     else:
                         wants_report, explicitly_asks_send = is_report_request(user_question)
                         if wants_report:
+                            st.session_state.pop("assistant_latest_result", None)
                             try:
                                 report_result = analyze_day(assistant_df, (chat_start, chat_end), model=model, use_llm=use_llm)
                                 st.session_state["pending_report"] = {
@@ -425,19 +451,82 @@ elif page == "Chat assistant":
                                     "send_requested": explicitly_asks_send,
                                 }
                                 reply = (f"I prepared a report for **{chat_start} to {chat_end}** using Python analytics. "
-                                         "It has **not** been emailed. Review the preview below, choose a saved recipient list, "
+                                         "It has **not** been emailed. Review the HTML preview below, choose a saved recipient list, "
                                          "and confirm sending when ready.")
                             except Exception as exc:
                                 reply = f"I could not prepare the report: {exc}"
                         else:
                             reply = answer_question(chat_data, user_question, model=model, use_llm=use_llm)
+                            st.session_state["assistant_latest_result"] = {
+                                "question": user_question,
+                                "answer": reply,
+                                "start": str(chat_start),
+                                "end": str(chat_end),
+                            }
                         messages = st.session_state.setdefault("assistant_messages", [])
                         messages.append({"role": "user", "content": user_question})
-                        messages.append({"role": "assistant", "content": reply})
+                        messages.append({"role": "assistant", "content": reply, "question": user_question,
+                                         "start": str(chat_start), "end": str(chat_end)})
+                        # A new key clears the input for the next question without clearing
+                        # a widget's session_state after the widget has been instantiated.
+                        st.session_state["chat_question_generation"] = question_generation + 1
 
-                for message in st.session_state.get("assistant_messages", []):
-                    with st.chat_message(message["role"]):
-                        st.markdown(message["content"])
+                # Render assistant answers in a safe, email-friendly HTML card.
+                messages = st.session_state.get("assistant_messages", [])
+                for index, message in enumerate(messages):
+                    if message.get("role") == "user":
+                        with st.chat_message("user"):
+                            st.markdown(message.get("content", ""))
+                    else:
+                        question_text = message.get("question", "")
+                        if not question_text and index > 0:
+                            question_text = messages[index - 1].get("content", "")
+                        result_start = message.get("start", str(chat_start))
+                        result_end = message.get("end", str(chat_end))
+                        answer_text = str(message.get("content", ""))
+                        with st.chat_message("assistant"):
+                            components.html(
+                                render_chat_result_html(question_text, answer_text, result_start, result_end),
+                                height=min(760, max(220, 155 + len(answer_text.splitlines()) * 25)),
+                                scrolling=True,
+                            )
+
+                # Share only the latest normal Q&A result; prepared full reports use the separate report flow below.
+                latest_result = st.session_state.get("assistant_latest_result")
+                if latest_result and not st.session_state.get("pending_report"):
+                    st.divider()
+                    st.subheader("Share this result by email")
+                    st.caption(f"Result date range: {latest_result['start']} to {latest_result['end']}. The email contains the formatted HTML result and a plain-text alternative.")
+                    recipient_lists = {}
+                    recipient_storage_error = None
+                    try:
+                        recipient_lists = load_recipient_lists()
+                    except Exception as exc:
+                        recipient_storage_error = str(exc)
+                    if recipient_storage_error:
+                        st.warning(f"Could not load saved recipient lists: {recipient_storage_error}")
+                        st.info("Configure the private recipient-list spreadsheet or check the settings, then retry.")
+                    elif not recipient_lists:
+                        st.info("No saved recipient lists are available. Create a list on the Settings page before emailing results.")
+                    else:
+                        list_names = list(recipient_lists.keys())
+                        selected_result_list = st.selectbox("Email recipient list", list_names, key="chat_result_recipient_list")
+                        result_addresses = recipient_lists.get(selected_result_list, [])
+                        st.caption(f"Recipients ({len(result_addresses)}): " + (", ".join(result_addresses) if result_addresses else "This list is empty."))
+                        confirm_result_email = st.checkbox("I reviewed this result and confirm emailing it to the selected list.", key="confirm_chat_result_email")
+                        if st.button("Email HTML result", type="primary", disabled=(not confirm_result_email or not result_addresses), key="email_chat_result"):
+                            try:
+                                period = f"{latest_result['start']} to {latest_result['end']}"
+                                send_gmail(
+                                    ", ".join(result_addresses),
+                                    f"CSAT Assistant Result — {period}",
+                                    render_chat_result_plain_text(latest_result["question"], latest_result["answer"], latest_result["start"], latest_result["end"]),
+                                    html_body=render_chat_result_html(latest_result["question"], latest_result["answer"], latest_result["start"], latest_result["end"]),
+                                )
+                                st.success(f"HTML result emailed to the '{selected_result_list}' recipient list.")
+                                st.session_state.pop("assistant_latest_result", None)
+                            except Exception as exc:
+                                st.error(f"Email failed: {exc}")
 
                 pending = st.session_state.get("pending_report")
                 if pending:
@@ -471,6 +560,7 @@ elif page == "Chat assistant":
                                 st.session_state["admin_flash_message"] = f"Report emailed to the '{selected_recipients}' list."
                                 st.session_state["last_sent_report_period"] = period
                                 st.session_state.pop("pending_report", None)
+                                st.session_state.pop("assistant_latest_result", None)
                                 st.rerun()
                             except Exception as exc:
                                 st.error(f"Email failed: {exc}")
@@ -664,36 +754,262 @@ elif page == "Scheduler":
 
     st.markdown("**Failure handling:** missing/unavailable Drive file, no rows in the selected date range, missing recipient list, and Gmail errors are recorded here. Concurrent runs are refused and shown as skipped. The report is only marked successful after the email send succeeds.")
 
-elif page == "How to use":
-    st.subheader("Quick start")
+elif page == "AI Solution":
+    st.subheader("AI feedback analysis — selected dates")
     st.markdown("""
-    1. Install Python 3.11 or newer.
-    2. Run `pip install -r requirements.txt`.
-    3. Copy `.env.example` to `.env`; set `DRIVE_DOWNLOAD_URL` to your native Google Sheets URL and configure Gmail if needed.
-    4. Install Ollama and pull a model, e.g. `ollama pull gemma3:4b`.
-    5. Run `streamlit run app.py`.
-    6. Choose Google Sheets (live data) or Laptop (manual test upload). The Scheduler always uses the configured Google Sheet only.
-    7. Open Scheduler to configure the date range, time, frequency, and saved recipient list.
+    Select a date range to display the original survey rows and ask **local Gemma (`gemma3:4b`)** to add six AI interpretation columns, including an airline-specific `AI_Category`. The original `Category` column from the survey is preserved. This is designed as a management demonstration: it shows how AI can turn free-text feedback into structured issue signals and possible actions.
+
+    Results are displayed here and can be downloaded as CSV; the original Google Sheet is not modified.
     """)
-    st.subheader("Chat assistant question examples")
-    st.markdown("""
-    - `Which customers need recovery follow-up?`
-    - `Show customer impact by category.`
-    - `What alerts and risks need attention?`
-    - `Which customers are impacted by Baggage issues?`
-    - `Why is Baggage low CSAT?`
-    - `Which flights or airports have the most low-CSAT records?`
-    - `Give me an executive summary and recommended actions.`
-    - `Prepare a report for this date range.`
-    """)
-    st.subheader("Important")
-    st.markdown("""
-    - The included Excel file is synthetic demonstration data, not real customer data.
-    - Customer impact counts use distinct `CustomerName` values in low-CSAT records; the schema does not include a verified customer ID.
-    - Staff CSAT comparisons are descriptive, not proof that a staff member caused a score.
-    - Theme/alert rules are evidence signals, not confirmed operational root causes.
-    - Chat/report questions do not send email directly. Review a generated report and explicitly confirm delivery.
-    - Local Ollama uses a loopback endpoint only. On Streamlit Community Cloud, the app container's localhost is not your laptop's Ollama; Python insights still work online, but real Ollama commentary requires running the admin app where Ollama is installed.
-    - On Streamlit Community Cloud, do not rely on an in-process background scheduler: the app may sleep/restart. Use an external scheduler/worker for reliable production delivery.
-    - The Scheduler reads the configured native Google Sheet through the service account and never falls back to the local/sample Excel file.
-    """)
+    with st.expander("How this demonstrates the value of AI", expanded=False):
+        st.markdown("""
+        - **AI_Category:** classifies the comment into a consistent airline-service category, such as Flight Changes, Refunds, Baggage, or Check-in & Boarding. It is separate from the original survey `Category` column.
+        - **Primary/secondary issue:** groups customer complaints beyond the existing form category.
+        - **Sentiment:** indicates the tone expressed in the comment.
+        - **Root-cause hypothesis:** suggests what to investigate; it is not a confirmed cause.
+        - **Recommended action:** gives management a practical next step to validate.
+
+        Python continues to calculate numerical KPIs. Gemma interprets the written comments. Management should validate suggested causes against operational data before taking action.
+        """)
+    st.caption("Local execution requirement: run this admin app on your laptop while Ollama is running. A Streamlit Cloud server cannot reach Ollama running on your laptop's localhost.")
+    if st.button("Load feedback rows", type="secondary", key="howto_load_feedback"):
+        with st.spinner("Loading feedback from the configured source..."):
+            loaded_df = read_source()
+        if loaded_df is not None:
+            st.session_state["howto_feedback_df"] = loaded_df
+            st.session_state.pop("howto_ai_df", None)
+
+    source_df = st.session_state.get("howto_feedback_df")
+    if source_df is not None and not source_df.empty:
+        dates = sorted(pd.to_datetime(source_df["SurveyDate"], errors="coerce").dropna().dt.date.unique().tolist())
+        if dates:
+            date_col1, date_col2 = st.columns(2)
+            start_date = date_col1.date_input("Start date", value=dates[0], min_value=dates[0], max_value=dates[-1], key="howto_start_date")
+            end_date = date_col2.date_input("End date", value=dates[-1], min_value=dates[0], max_value=dates[-1], key="howto_end_date")
+            if start_date > end_date:
+                st.error("Start date must be on or before end date.")
+            else:
+                date_values = pd.to_datetime(source_df["SurveyDate"], errors="coerce").dt.date
+                selected_df = source_df.loc[date_values.between(start_date, end_date)].copy().reset_index(drop=True)
+                st.write(f"**{len(selected_df):,} survey rows** from {start_date} through {end_date}.")
+                st.dataframe(selected_df, use_container_width=True, hide_index=True)
+                model_name = st.text_input("Local Ollama model", value=model or "gemma3:4b", key="howto_gemma_model")
+                max_rows = st.number_input("Maximum comments to analyze in this run", min_value=1, max_value=500, value=min(30, max(1, len(selected_df))), key="howto_max_rows")
+                st.caption("Gemma analyzes comments in batches of 5 per model request to reduce overhead. Larger batches can be faster but may reduce output reliability on small local models.")
+                if st.button("Analyze selected rows with Gemma", type="primary", disabled=selected_df.empty, key="howto_analyze_gemma"):
+                    from urllib.parse import urlparse
+                    import json
+                    import requests
+                    from config import OLLAMA_URL
+                    host = urlparse((OLLAMA_URL or "http://localhost:11434").strip()).hostname
+                    if host not in {"localhost", "127.0.0.1", "::1"}:
+                        st.error("Local-only mode is enabled. Set OLLAMA_URL to http://localhost:11434.")
+                    else:
+                        result_df = selected_df.head(int(max_rows)).copy()
+                        airline_categories = [
+                            "Booking & Ticketing",
+                            "Flight Changes",
+                            "Cancellations & Disruptions",
+                            "Flight Delays",
+                            "Refunds",
+                            "Baggage",
+                            "Check-in & Boarding",
+                            "Fares, Fees & Payments",
+                            "Customer Service & Staff Communication",
+                            "Airport Experience",
+                            "Seat & Cabin Experience",
+                            "Onboard Service",
+                            "Special Assistance",
+                            "Loyalty & Miles",
+                            "Website & Mobile App",
+                            "Other / Unclear",
+                        ]
+                        new_columns = ["primary_issue", "secondary_issue", "sentiment", "root_cause_hypothesis", "recommended_action", "AI_Category"]
+                        for col in new_columns:
+                            if col not in result_df.columns:
+                                result_df[col] = ""
+                        progress = st.progress(0, text="Preparing comment batches for Gemma...")
+                        try:
+                            from gemma_batch_analysis import analyze_feedback_batch
+
+                            # Avoid one model generation per row: send small groups in one request.
+                            # Stable row_id values map every returned classification to its source row.
+                            batch_size = 5
+                            pending = []
+                            for idx, row in result_df.iterrows():
+                                comment = str(row.get("CustomerComment", "") or "").strip()
+                                if not comment:
+                                    empty_values = {
+                                        "primary_issue": "No comment provided",
+                                        "secondary_issue": "Not stated",
+                                        "sentiment": "Unknown",
+                                        "root_cause_hypothesis": "Insufficient text to suggest a cause",
+                                        "recommended_action": "Review other survey fields if action is required",
+                                        "AI_Category": "Other / Unclear",
+                                    }
+                                    for col in new_columns:
+                                        result_df.at[idx, col] = empty_values.get(col, "")
+                                else:
+                                    pending.append({
+                                        "row_id": int(idx),
+                                        "comment": comment[:1200],
+                                        "csat_score": str(row.get("CSATScore", "")),
+                                        "original_category": str(row.get("Category", "")),
+                                    })
+
+                            processed = 0
+                            for offset in range(0, len(pending), batch_size):
+                                batch = pending[offset:offset + batch_size]
+                                returned = analyze_feedback_batch(
+                                    batch,
+                                    model=model_name.strip() or "gemma3:4b",
+                                    ollama_url=OLLAMA_URL,
+                                    categories=airline_categories,
+                                )
+                                expected_ids = {item["row_id"] for item in batch}
+                                missing_ids = expected_ids - set(returned)
+                                # Repair an incomplete batch response with small single-row retries.
+                                for item in batch:
+                                    if item["row_id"] in missing_ids:
+                                        returned.update(analyze_feedback_batch(
+                                            [item],
+                                            model=model_name.strip() or "gemma3:4b",
+                                            ollama_url=OLLAMA_URL,
+                                            categories=airline_categories,
+                                        ))
+                                missing_ids = expected_ids - set(returned)
+                                if missing_ids:
+                                    raise ValueError(f"Gemma did not return results for row IDs: {sorted(missing_ids)}. Retry this batch.")
+
+                                for item in batch:
+                                    row_id = item["row_id"]
+                                    values = returned[row_id]
+                                    predicted_category = str(values.get("AI_Category", "") or "").strip()
+                                    values["AI_Category"] = predicted_category if predicted_category in airline_categories else "Other / Unclear"
+                                    for col in new_columns:
+                                        value = values.get(col, "")
+                                        result_df.at[row_id, col] = str(value).strip() if value is not None else ""
+                                    processed += 1
+                                progress.progress(
+                                    processed / max(1, len(pending)),
+                                    text=f"Gemma analyzed {processed} of {len(pending)} comments in batches of {batch_size}...",
+                                )
+
+                            st.session_state["howto_ai_df"] = result_df
+                            st.session_state["howto_ai_range"] = (str(start_date), str(end_date))
+                            st.session_state.pop("ai_solution_latest_result", None)
+                            st.success(f"Gemma analyzed {len(result_df)} row(s) using batches of up to {batch_size}; empty comments were handled locally.")
+                        except requests.exceptions.ConnectionError:
+                            st.error("Could not connect to Ollama. Start Ollama and verify `ollama run gemma3:4b` works on this laptop.")
+                        except Exception as exc:
+                            st.error(f"Gemma analysis stopped: {exc}")
+                            st.session_state["howto_ai_df"] = result_df
+                            st.session_state["howto_ai_range"] = (str(start_date), str(end_date))
+                            st.session_state.pop("ai_solution_latest_result", None)
+                            st.success(f"Gemma analyzed {len(result_df)} row(s). Review the hypotheses before using them for decisions.")
+                        except requests.exceptions.ConnectionError:
+                            st.error("Could not connect to Ollama. Start Ollama and verify `ollama run gemma3:4b` works on this laptop.")
+                        except Exception as exc:
+                            st.error(f"Gemma analysis stopped: {exc}")
+                ai_df = st.session_state.get("howto_ai_df")
+                ai_range = st.session_state.get("howto_ai_range")
+                active_range = (str(start_date), str(end_date))
+                if ai_df is not None and ai_range == active_range:
+                    st.subheader("Results with AI interpretation columns")
+                    st.dataframe(ai_df, use_container_width=True, hide_index=True)
+                    csv = ai_df.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button("Download analyzed rows as CSV", data=csv, file_name=f"gemma_feedback_{start_date}_to_{end_date}.csv", mime="text/csv", key="howto_download_ai_csv")
+                    st.info("Gemma generated AI_Category, primary/secondary issues, sentiment, root-cause hypotheses, and recommended actions. Hypotheses are not verified facts; the original Google Sheet has not been changed.")
+
+                    st.divider()
+                    st.subheader("Ask Gemma to analyze this AI-enriched table")
+                    st.caption("This assistant uses the exact table above, including its AI_Category and interpretation columns. Ask for patterns, evidence-based explanations, priorities, and management actions. It does not simply summarize KPI counts.")
+                    ai_sample_questions = [
+                        ("Main drivers", "Analyze this table. What are the strongest drivers of low CSAT? Use AI_Category, primary_issue, sentiment, and original comments as evidence."),
+                        ("Why CSAT is low", "Why are customers dissatisfied in this table? Separate observed evidence from root-cause hypotheses, and recommend actions."),
+                        ("Compare positive vs low", "Compare positive-CSAT and low-CSAT feedback. What issues differ, and what should management prioritize?"),
+                        ("Executive action plan", "Prepare an executive HTML-ready summary of the top three issues, evidence, hypotheses, actions, and how to measure improvement."),
+                    ]
+                    ai_q_generation = int(st.session_state.get("ai_solution_question_generation", 0))
+                    ai_question_key = f"ai_solution_question_{ai_q_generation}"
+                    ai_example_cols = st.columns(4)
+                    for example_col, (example_label, example_text) in zip(ai_example_cols, ai_sample_questions):
+                        with example_col:
+                            if st.button(example_label, key=f"ai_solution_example_{example_label.lower().replace(' ', '_')}", use_container_width=True):
+                                st.session_state[ai_question_key] = example_text
+                    with st.form("ai_solution_analysis_form", clear_on_submit=False):
+                        ai_question = st.text_area(
+                            "Question about the AI-enriched table",
+                            placeholder="Example: Which recurring issues are most associated with low CSAT, and what actions should management take?",
+                            key=ai_question_key,
+                            height=95,
+                        )
+                        ai_ask_clicked = st.form_submit_button("Analyze table with Gemma", type="primary")
+                    if ai_ask_clicked:
+                        if not ai_question.strip():
+                            st.warning("Enter a question or select one of the examples first.")
+                        else:
+                            with st.spinner(f"Gemma is analyzing {len(ai_df)} enriched records. This may take a moment..."):
+                                try:
+                                    ai_chat_answer = answer_question(
+                                        ai_df, ai_question, model=st.session_state.get("howto_gemma_model", model or "gemma3:4b"),
+                                        use_llm=True, force_llm=True,
+                                    )
+                                    st.session_state["ai_solution_latest_result"] = {
+                                        "question": ai_question,
+                                        "answer": ai_chat_answer,
+                                        "start": str(start_date),
+                                        "end": str(end_date),
+                                        "model": st.session_state.get("howto_gemma_model", model or "gemma3:4b"),
+                                    }
+                                    st.session_state["ai_solution_question_generation"] = ai_q_generation + 1
+                                except Exception as exc:
+                                    st.error(f"Gemma could not analyze this table: {exc}")
+                    latest_ai_result = st.session_state.get("ai_solution_latest_result")
+                    if latest_ai_result and (latest_ai_result.get("start"), latest_ai_result.get("end")) == active_range:
+                        st.markdown("#### AI analysis result (HTML preview)")
+                        components.html(
+                            render_chat_result_html(latest_ai_result["question"], latest_ai_result["answer"], latest_ai_result["start"], latest_ai_result["end"]),
+                            height=min(1050, max(320, 190 + len(latest_ai_result["answer"].splitlines()) * 26)),
+                            scrolling=True,
+                        )
+                        st.caption(f"Analysis model: {latest_ai_result.get('model', 'gemma3:4b')} · Date range: {latest_ai_result['start']} to {latest_ai_result['end']}")
+                        with st.expander("View the answer as Markdown text", expanded=False):
+                            st.markdown(latest_ai_result["answer"])
+
+                        st.divider()
+                        st.subheader("Share the AI analysis with management")
+                        ai_result_lists = {}
+                        ai_result_storage_error = None
+                        try:
+                            ai_result_lists = load_recipient_lists()
+                        except Exception as exc:
+                            ai_result_storage_error = str(exc)
+                        if ai_result_storage_error:
+                            st.warning(f"Could not load saved recipient lists: {ai_result_storage_error}")
+                        elif not ai_result_lists:
+                            st.info("No saved recipient lists are available. Create a list on Settings first.")
+                        else:
+                            ai_result_names = list(ai_result_lists.keys())
+                            selected_ai_result_list = st.selectbox("Management email recipient list", ai_result_names, key="ai_solution_result_recipient_list")
+                            ai_result_addresses = ai_result_lists.get(selected_ai_result_list, [])
+                            st.caption(f"Recipients ({len(ai_result_addresses)}): " + (", ".join(ai_result_addresses) if ai_result_addresses else "This list is empty."))
+                            ai_result_confirm = st.checkbox("I reviewed this AI analysis and confirm sending it by email.", key="confirm_ai_solution_result_email")
+                            if st.button("Email AI analysis as HTML", type="primary", disabled=(not ai_result_confirm or not ai_result_addresses), key="email_ai_solution_result"):
+                                try:
+                                    period = f"{latest_ai_result['start']} to {latest_ai_result['end']}"
+                                    send_gmail(
+                                        ", ".join(ai_result_addresses),
+                                        f"Gemma CSAT Analysis — {period}",
+                                        render_chat_result_plain_text(latest_ai_result["question"], latest_ai_result["answer"], latest_ai_result["start"], latest_ai_result["end"]),
+                                        html_body=render_chat_result_html(latest_ai_result["question"], latest_ai_result["answer"], latest_ai_result["start"], latest_ai_result["end"]),
+                                    )
+                                    st.success(f"HTML analysis emailed to the '{selected_ai_result_list}' recipient list.")
+                                except Exception as exc:
+                                    st.error(f"Email failed: {exc}")
+                elif ai_df is not None and ai_range != active_range:
+                    st.info("The saved Gemma table belongs to a different date range. Click **Analyze selected rows with Gemma** to refresh it for the newly selected dates before asking questions.")
+        else:
+            st.warning("No valid survey dates were found in the loaded data.")
+    elif source_df is not None:
+        st.info("The configured data source contains no survey rows.")
